@@ -2,14 +2,17 @@ from functools import cmp_to_key
 import cv2 as cv
 import numpy as np
 from multiprocessing import Pool
+from multiprocessing import cpu_count
 import matplotlib.pyplot as plt
 import time
-
+import warnings
+warnings.filterwarnings("ignore")
 ################################
 #############ARGUMENTS##########
 ################################
 # 是否使用多进程加速
 IS_USE_MULTIPROCESSING = True
+CPU_COUNT = cpu_count()
 # 升采样参数
 PRE_BLUR_SCALE = 2
 PRE_BLUR_KSIZE = (0, 0)
@@ -147,8 +150,8 @@ def FindAllKeyPoints(gaussian_imgs, DoG_imgs):
                             keypoints_with_orientations = AssignOrientationToKeypoints(keypoint, octave_index,cal_img)
                             for kk in keypoints_with_orientations:
                                 keypoints.append(kk)
-    print(f"cnt_local_extrema: {cnt_local_extrema}")
-    print(f"cnt_local_extrema: {cnt_accruate_keypoints}")
+    # print(f"cnt_local_extrema: {cnt_local_extrema}")
+    # print(f"cnt_local_extrema: {cnt_accruate_keypoints}")
     return keypoints
 def FindAllKeyPointsMuti(gaussian_imgs, DoG_imgs):
     """
@@ -156,8 +159,6 @@ def FindAllKeyPointsMuti(gaussian_imgs, DoG_imgs):
     """
     keypoints_list = []
     threshold = np.floor(0.5 * CONTRAST_THRESHOLD / NUM_INTVLS * 255)  # from OpenCV implementation
-    cnt_local_extrema = 0
-    cnt_accruate_keypoints = 0
     args = []
     for octave_index, DoG_imgs_in_octave in enumerate(DoG_imgs):
         # 将DOG图像中的三张图像进行zip，然后取中间那张图像的中心点进行比较
@@ -167,9 +168,9 @@ def FindAllKeyPointsMuti(gaussian_imgs, DoG_imgs):
             for i in range(IMAGE_BORDER_WIDTH, img_truple[0].shape[0] - IMAGE_BORDER_WIDTH):
                 for j in range(IMAGE_BORDER_WIDTH, img_truple[0].shape[1] - IMAGE_BORDER_WIDTH):
                     args.append((i,j,img_truple,threshold,octave_index,layer_index,gaussian_imgs,DoG_imgs_in_octave))
-    print(len(args))
-    pool = Pool(processes=8)
-    results = pool.starmap(MutiTask, args)
+    print(f"多进程生成keypoints共需处理: {len(args)}组数据")
+    pool = Pool(processes=CPU_COUNT)
+    results = pool.starmap(MutiTaskKeypoint, args)
     pool.close()
     pool.join()
     for result in results:
@@ -177,7 +178,7 @@ def FindAllKeyPointsMuti(gaussian_imgs, DoG_imgs):
             for kk in result:
                 keypoints_list.append(kk)
     return keypoints_list
-def MutiTask(i,j,img_truple,threshold,octave_index,layer_index,gaussian_imgs,DoG_imgs_in_octave):
+def MutiTaskKeypoint(i, j, img_truple, threshold, octave_index, layer_index, gaussian_imgs, DoG_imgs_in_octave):
     """
     """
     if IsLocalExtrema(*(Find3x3x3Cube(*(img_truple), i, j)), threshold):
@@ -530,7 +531,6 @@ def CalTrilinearInterpolation(row_list, col_list, mag_list, ori_list, hist_appen
         hist_append[row_bin_floor + 2, col_bin_floor + 2, ori_bin_floor] += c110
         hist_append[row_bin_floor + 2, col_bin_floor + 2, (ori_bin_floor + 1) % SIFT_DESCR_HIST_BINS] += c111
     return hist_append
-
 def NormalizeDescriptor(hist_append):
     """归一化直方图
     """
@@ -543,8 +543,55 @@ def NormalizeDescriptor(hist_append):
     descript[descript < 0] = 0
     descript[descript > 255] = 255
     return descript
-
-def generateDescriptors(keypoints, gaussian_img):
+def GenerateDescriptorsMuti(keypoints, gaussian_img):
+    """生成描述子
+    """
+    cnt = 0
+    descriptors = []
+    args = []
+    for kp in keypoints:
+        octave, layer, scale = UnpackOctave(kp)
+        # def __init__(self, pt=(0, 0), size=0, orientation=0, response=0, octave=0, class_id=None, des=None):
+        # cv.KeyPoint(keypoint.pt[0],keypoint.pt[1], keypoint.size, keypoint.orientation, keypoint.response, keypoint.octave)
+        # cv.KeyPoint(*keypoint.pt, keypoint.size, orientation, keypoint.response, keypoint.octave)
+        my_kp = MyKeyPoint(kp.pt,kp.size,kp.angle,kp.response,kp.octave)
+        args.append((gaussian_img, my_kp, octave, layer, scale))
+    print(f"多进程开始生成descriptor共需处理{len(args)}个")
+    pool = Pool(processes=CPU_COUNT)
+    results = pool.starmap(MutiTaskDescriptor, args)
+    pool.close()
+    pool.join()
+    for result in results:
+        descriptors.append(result)
+    return np.array(descriptors, dtype='float32')
+def MutiTaskDescriptor(gaussian_img, kp, octave, layer, scale):
+    """
+    """
+    w_fact = -0.5 / ((0.5 * SIFT_DESCR_WIDTH) ** 2)
+    # 乘以8/2Π，8为直方图有8个bin，2Π为角度取值范围的长度，把方向的索引归于0~8
+    per_degree = SIFT_DESCR_HIST_BINS / 360.
+    pr_img = gaussian_img[octave + 1, layer]
+    num_rows, num_cols = pr_img.shape
+    point = np.round(scale * np.array(kp.pt)).astype('int')
+    # bins_per_degree = SIFT_DESCR_HIST_BINS / 360.
+    angle = 360. - kp.orientation
+    # d*d*n的三维直方图数组,实际上分配的大小是d+2*d+2*n
+    hist_append = np.zeros((SIFT_DESCR_WIDTH + 2, SIFT_DESCR_WIDTH + 2, SIFT_DESCR_HIST_BINS))
+    # 计算特征描述子过程中，特征点周围的d*d个区域中，每个区域的宽度为m*σ个像素，SIFT_DESCR_SCL_FCTR即m的默认值，σ为特征点的尺度，m=3
+    hist_width = SIFT_DESCR_SCL_FCTR * 0.5 * scale * kp.size
+    # 所以搜索的半径是：SIFT_DESCR_SCL_FCTR * scale * ( d + 1.0 ) * sqrt(2) / 2
+    half_width = int(round(hist_width * np.sqrt(2) * (SIFT_DESCR_WIDTH + 1) * 0.5))
+    # 取图像长宽和r之间的最小值作为r的值
+    half_width = int(min(half_width, np.sqrt(num_rows ** 2 + num_cols ** 2)))
+    # 计算梯度幅值和方向
+    row_list, col_list, mag_list, ori_list = CalGradMagOri(half_width, point, pr_img, num_rows, num_cols, hist_width,
+                                                           w_fact, angle, per_degree)
+    # 计算三线性插值后的直方图
+    hist_append = CalTrilinearInterpolation(row_list, col_list, mag_list, ori_list, hist_append)
+    # 归一化描述子
+    descriptor = NormalizeDescriptor(hist_append)
+    return descriptor
+def GenerateDescriptors(keypoints, gaussian_img):
     """生成描述子
     """
     cnt = 0
@@ -574,57 +621,23 @@ def generateDescriptors(keypoints, gaussian_img):
         # 归一化描述子
         descriptor = NormalizeDescriptor(hist_append)
         descriptors.append(descriptor)
-    ###############################DEBUG##############################################################
-    #     x1,x2 = point[1] - half_width,point[1] + half_width + 1
-    #     y1,y2 = point[0] - half_width,point[0] + half_width + 1
-    #     x1,x2 = max(0,x1),min(num_rows,x2)
-    #     y1,y2 = max(0,y1),min(num_cols,y2)
-    #     # print(f"{num_rows, num_cols}",end=" ")
-    #     new_img = pr_img[x1:x2,y1:y2]
-    #     if new_img.shape[0] % 4 == 1 and new_img.shape[1] %4 == 1:
-    #         cnt += 1
-    #         plt.subplot(2, 2, cnt)
-    #         #     plt.arrow(x0, y0, length*0.8 * -np.cos(angle), length * -np.sin(angle),
-    #         #       head_width=1, head_length=1, fc='yellow', ec='yellow')
-    #         new_des = descriptor.reshape(4,4,8)
-    #         print(f"point:{point},x1:{x1},x2:{x2},y1:{y1},y2:{y2},shape:{new_img.shape}")
-    #         plt.imshow(new_img)
-    #         # 定义正方形图像的边长
-    #         image_size = new_img.shape[0]
-    #         # 定义图像中每个小方块的边长
-    #         block_size = image_size // 4
-    #         # 遍历每个小方块，并在其中绘制8个方向
-    #         color = "darkslateblue"
-    #         for i in range(5):
-    #             plt.plot([i * block_size, i * block_size], [0, image_size-1], '-', linewidth=3, color=color)
-    #             plt.plot([0, image_size-1], [i * block_size, i * block_size], '-', linewidth=3, color=color)
-    #         for i in range(4):
-    #             for j in range(4):
-    #                 x_start = i * block_size + block_size // 2
-    #                 y_start = j * block_size + block_size // 2
-    #                 for k in range(8):
-    #                     lenth = new_des[i,j,k] / np.max(new_des)
-    #                     plt.arrow(x_start, y_start, block_size/2.5 * np.sin(k*np.pi/4) * lenth, block_size/2.5 * np.cos(k*np.pi/4) * lenth,
-    #                               head_width=0.5, head_length=0.5, fc='yellow', ec='yellow')
-    #         plt.title(f"point:{point},x1:{x1},x2:{x2},y1:{y1},y2:{y2},shape:{new_img.shape}")
-    #         if cnt > 3:
-    #             break
-    # plt.savefig("./img/descript.png")
-    # plt.show()
-    #########################DEBUG##############################################################
     return np.array(descriptors, dtype='float32')
 
-
-
-if __name__ == '__main__':
+def MySIFT():
+    all_use_time_start = time.time()
     IS_USE_MULTIPROCESSING = True
-    raw_image = cv.imread('box_in_scene.png', 0)
+    if IS_USE_MULTIPROCESSING:
+        print(f"使用多进程,进程数为:{CPU_COUNT}")
+    else:
+        print("不使用多进程")
+    raw_image = cv.imread('xiaogong.jpg', 0)
+    if raw_image is None:
+        print("图片读取失败")
+        exit()
     base_image = Upsampling(raw_image)
-    print(f"base_image.shape: {base_image.shape},raw_image.shape: {raw_image.shape}")
     num_octaves = Get_Octaves_Num(base_image)
-    print(f"num_octaves: {num_octaves}")
     guassian_kernels = GenerateGaussianKernels()
-    print(f"guassian_kernels: {guassian_kernels}")
+    print(f"读入图片大小为{raw_image.shape}，生成的金字塔octaves为{num_octaves}")
     gaussian_imgs = GenerateGaussianImages(base_image, num_octaves, guassian_kernels)
     DoG_imgs = GenerateDoGImages(gaussian_imgs)
     if IS_USE_MULTIPROCESSING:
@@ -632,23 +645,38 @@ if __name__ == '__main__':
         start = time.time()
         keypoints = FindAllKeyPointsMuti(gaussian_imgs, DoG_imgs)
         end = time.time()
-        print(f"FindAllKeyPointsMutiprosses time = {end - start}")
-        print(f"keypoints: {len(keypoints)}")
+        print(f"多进程寻找keypoints花费{np.round(end - start, 3)}s，共找到{len(keypoints)}个keypoints")
         for keypoint in keypoints:
-            cvKeyPoints.append(cv.KeyPoint(keypoint.pt[0],keypoint.pt[1], keypoint.size, keypoint.orientation, keypoint.response, keypoint.octave))
+            cvKeyPoints.append(
+                cv.KeyPoint(keypoint.pt[0], keypoint.pt[1], keypoint.size, keypoint.orientation, keypoint.response,
+                            keypoint.octave))
         cvKeyPoints = convertKeypointsToInputImageSize(cvKeyPoints)
     else:
         start = time.time()
         keypoints = FindAllKeyPoints(gaussian_imgs, DoG_imgs)
         end = time.time()
         cvKeyPoints = keypoints
-        print(f"FindAllKeyPoints time = {end - start}")
-        print(f"keypoints: {len(keypoints)}")
+        print(f"寻找keypoints花费{np.round(end - start, 3)}s，共找到{len(keypoints)}个keypoints")
         cvKeyPoints = convertKeypointsToInputImageSize(cvKeyPoints)
     removed_cvkeypoints = RemoveDuplicateKeypoints(cvKeyPoints)
-    descriptors = generateDescriptors(removed_cvkeypoints, gaussian_imgs)
-    print(f"descriptors: {np.sum(descriptors)}")
-    img1 = cv.drawKeypoints(raw_image, cvKeyPoints, None, color=(0, 255, 0), flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    print(f"去除重复的keypoints后，剩余{len(removed_cvkeypoints)}个keypoints")
+    if IS_USE_MULTIPROCESSING:
+        start = time.time()
+        descriptors = GenerateDescriptorsMuti(removed_cvkeypoints, gaussian_imgs)
+        end = time.time()
+        print(f"多进程计算descriptors花费：{np.round(end - start, 3)}s")
+    else:
+        start = time.time()
+        descriptors = GenerateDescriptors(removed_cvkeypoints, gaussian_imgs)
+        end = time.time()
+        print(f"计算descriptors花费：{np.round(end - start, 3)}s")
+    all_use_time_end = time.time()
+    print(f"总共花费：{np.round(all_use_time_end - all_use_time_start, 3)}s")
+    img1 = cv.drawKeypoints(raw_image, cvKeyPoints, None, color=(0, 255, 0),
+                            flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
     plt.imshow(img1)
     plt.show()
-    plt.imsave('box_in_scene_keypoints.png', img1)
+
+
+if __name__ == '__main__':
+    MySIFT()
