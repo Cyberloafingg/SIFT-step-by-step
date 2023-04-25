@@ -397,10 +397,6 @@ def convertKeypointsToInputImageSize(keypoints):
             keypoint.response,
             ((keypoint.octave & ~255) | ((keypoint.octave - 1) & 255))
         )
-        # keypoint.pt = tuple(0.5 * np.array(keypoint.pt))
-        # keypoint.size *= 0.5
-        # keypoint.octave = (keypoint.octave & ~255) | ((keypoint.octave - 1) & 255)
-        # converted_keypoints.append(keypoint)
         converted_keypoints.append(keypoints_new)
     return converted_keypoints
 
