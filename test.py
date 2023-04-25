@@ -1,9 +1,4 @@
-import cv2
-import pysift
-image = cv2.imread('box_in_scene.png', 0)
+import MySIFT
 
-
-
-
-keypoints, descriptors = pysift.computeKeypointsAndDescriptors(image)
-print(len(keypoints))
+if __name__ == '__main__':
+    MySIFT.JudgeGoodMatch('xiaogonghead.jpg', 'xiaogong.jpg')
