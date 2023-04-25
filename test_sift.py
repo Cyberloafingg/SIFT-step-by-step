@@ -8,6 +8,8 @@ import time
 ################################
 #############ARGUMENTS##########
 ################################
+# 是否使用多进程加速
+IS_USE_MULTIPROCESSING = True
 # 升采样参数
 PRE_BLUR_SCALE = 2
 PRE_BLUR_KSIZE = (0, 0)
@@ -35,8 +37,20 @@ RADIUS_FCTR = 3
 ORI_HIST_BINS = 36
 # 特征点方向赋值过程中，梯度幅值达到最大值的80%则分裂为两个特征点，相当于主峰值80%能量的峰值
 ORI_PEAK_RATIO = 0.8
+# 计算特征描述子过程中，将特征点附近划分为d*d个区域，每个区域生成一个直方图，论文中设置为4
+SIFT_DESCR_WIDTH=4
+# 计算特征描述子过程中，每个方向直方图的bin个数，8个方向的梯度直方图
+SIFT_DESCR_HIST_BINS=8
+# 特征点方向赋值过程中，搜索邻域的半径为：3 * 1.5 * σ，分配方向时计算区域大小，根据3sigma外可忽略，圆半径3σ（3*1.5σ）
+SIFT_DESCR_SCL_FCTR=3
+# 算特征描述子过程中，特征描述子向量中元素的阈值(最大值，并且是针对归一化后的特征描述子)，超过此阈值的元素被强行赋值为此阈值，归一化处理中，对特征矢量中值大于0.2进行截断（大于0.2只取0.2）
+SIFT_DESCR_MAG_THR=0.2
 
-#######cv.KeyPoint(*keypoint.pt, keypoint.size, orientation, keypoint.response, keypoint.octave)
+################################
+#############FUNCTIONS##########
+################################
+
+
 class MyKeyPoint():
     def __init__(self, pt = (0,0), size = 0, orientation = 0, response = 0, octave = 0, class_id = None, des = None):
         self.pt = pt
@@ -162,8 +176,6 @@ def FindAllKeyPointsMuti(gaussian_imgs, DoG_imgs):
         if result is not None:
             for kk in result:
                 keypoints_list.append(kk)
-    print(f"cnt_local_extrema: {cnt_local_extrema}")
-    print(f"cnt_local_extrema: {cnt_accruate_keypoints}")
     return keypoints_list
 def MutiTask(i,j,img_truple,threshold,octave_index,layer_index,gaussian_imgs,DoG_imgs_in_octave):
     """
@@ -248,7 +260,10 @@ def IsAccurateKeyPoints(i, j, layer_index, octave_index, DoG_imgs_in_octave):
         # 计算公式为：(r+1)^2 / r < (tr(H))^2 / det(H) ---> (r+1)^2 * det(H) < (tr(H))^2 * r 使用乘法会更快一些
         if det > 0 and RATIO_THRESHOLD * (trace ** 2) < ((RATIO_THRESHOLD + 1) ** 2) * det:
             # 生成关键点
-            keypoint = MyKeyPoint()
+            if IS_USE_MULTIPROCESSING:
+                keypoint = MyKeyPoint()
+            else:
+                keypoint = cv.KeyPoint()
             # 关键点坐标为：((j + X_hat[0]) * (2^octave_index), (i + X_hat[1]) * (2^octave_index))
             keypoint.pt = ((j + X_hat[0]) * (2 ** octave_index), (i + X_hat[1]) * (2 ** octave_index))
             # 由于opencv中octave的存储方式是把octave_index和layer_index放在一个int32中，所以需要进行一些处理
@@ -337,8 +352,12 @@ def CalOrientationForPeaks(ori_max, ori_peaks, smooth_his, keypoint):
             orientation = 360. - interpolated_peak_index * 360. / ORI_HIST_BINS
             if abs(orientation - 360.) < 1e-7:
                 orientation = 0
-            new_keypoint = MyKeyPoint(keypoint.pt, keypoint.size, orientation, keypoint.response, keypoint.octave)
-            ori_keypoints.append(new_keypoint)
+            if IS_USE_MULTIPROCESSING:
+                new_keypoint = MyKeyPoint(keypoint.pt, keypoint.size, orientation, keypoint.response, keypoint.octave)
+                ori_keypoints.append(new_keypoint)
+            else:
+                new_keypoint = cv.KeyPoint(*keypoint.pt, keypoint.size, orientation, keypoint.response, keypoint.octave)
+                ori_keypoints.append(new_keypoint)
     return ori_keypoints
 def AssignOrientationToKeypoints(keypoint, octave_index, gauss_img):
     """计算关键点的方向
@@ -400,8 +419,205 @@ def convertKeypointsToInputImageSize(keypoints):
         converted_keypoints.append(keypoints_new)
     return converted_keypoints
 
+def MyCompareKP(kp1, kp2):
+    """参考了opencv的代码，对关键点进行排序，然后比较两个关键点是否相同
+    """
+    if kp1.pt[0] != kp2.pt[0]:
+        return kp1.pt[0] - kp2.pt[0]
+    if kp1.pt[1] != kp2.pt[1]:
+        return kp1.pt[1] - kp2.pt[1]
+    if kp1.size != kp2.size:
+        return kp2.size - kp1.size
+    if kp1.angle != kp2.angle:
+        return kp1.angle - kp2.angle
+    if kp1.response != kp2.response:
+        return kp2.response - kp1.response
+    if kp1.octave != kp2.octave:
+        return kp2.octave - kp1.octave
+    return kp2.class_id - kp1.class_id
+
+def RemoveDuplicateKeypoints(kp):
+    """先排序后去重。
+    """
+    if len(kp) < 2:
+        return kp
+    kp.sort(key=cmp_to_key(MyCompareKP))
+    unique_kp = [kp[0]]
+    for temp in kp[1:]:
+        last_kp = unique_kp[-1]
+        if last_kp.pt[0] != temp.pt[0] or \
+           last_kp.pt[1] != temp.pt[1] or \
+           last_kp.size != temp.size or \
+           last_kp.angle != temp.angle:
+            unique_kp.append(temp)
+    return unique_kp
+
+def UnpackOctave(keypoint):
+    """解析opencv中的keypoint的octave属性
+    """
+    octave = keypoint.octave & 255
+    layer = (keypoint.octave >> 8) & 255
+    if octave >= 128:octave = octave | -128
+    scale = 1 / np.float32(1 << octave) if octave >= 0 else np.float32(1 << -octave)
+    return octave, layer, scale
+def CalGradMagOri(half_width, point, img, num_rows, num_cols, hist_width, w, angle, per_degree):
+    """计算梯度方向和梯度幅值
+    """
+    # # 为了保证特征描述子具有旋转不变性，要以特征点为中心，在附近邻域内旋转θ角，即旋转为特征点的方向
+    cos_angle = np.cos(np.deg2rad(angle))
+    sin_angle = np.sin(np.deg2rad(angle))
+    row_list = []
+    col_list = []
+    mag_list = []
+    ori_list = []
+    for row in range(-half_width, half_width + 1):
+        for col in range(-half_width, half_width + 1):
+            row_rot = col * sin_angle + row * cos_angle
+            col_rot = col * cos_angle - row * sin_angle
+            # x' = x * 1/3sigma_oct + 1/2 * d - 0.5
+            row_bin = (row_rot / hist_width) + 0.5 * SIFT_DESCR_WIDTH - 0.5
+            # y' = y * 1/3sigma_oct + 1/2 * d - 0.5
+            col_bin = (col_rot / hist_width) + 0.5 * SIFT_DESCR_WIDTH - 0.5
+            if row_bin > -1 and row_bin < SIFT_DESCR_WIDTH and col_bin > -1 and col_bin < SIFT_DESCR_WIDTH:
+                window_row = int(round(point[1] + row))
+                window_col = int(round(point[0] + col))
+                if window_row > 0 and window_row < num_rows - 1 and window_col > 0 and window_col < num_cols - 1:
+                    dx = img[window_row, window_col + 1] - img[window_row, window_col - 1]
+                    dy = img[window_row - 1, window_col] - img[window_row + 1, window_col]
+                    gradient_magnitude = np.sqrt(dx * dx + dy * dy)
+                    gradient_orientation = np.rad2deg(np.arctan2(dy, dx)) % 360
+                    weight = np.exp(w * ((row_rot / hist_width) ** 2 + (col_rot / hist_width) ** 2))
+                    row_list.append(row_bin)
+                    col_list.append(col_bin)
+                    mag_list.append(gradient_magnitude * weight)
+                    ori_list.append((gradient_orientation - angle) * per_degree)
+    return row_list, col_list, mag_list, ori_list
+
+def CalTrilinearFrac(mag, row_frac, col_frac, ori_frac):
+    c1 = mag * row_frac
+    c0 = mag * (1 - row_frac)
+    c11 = c1 * col_frac
+    c10 = c1 * (1 - col_frac)
+    c01 = c0 * col_frac
+    c00 = c0 * (1 - col_frac)
+    c111 = c11 * ori_frac
+    c110 = c11 * (1 - ori_frac)
+    c101 = c10 * ori_frac
+    c100 = c10 * (1 - ori_frac)
+    c011 = c01 * ori_frac
+    c010 = c01 * (1 - ori_frac)
+    c001 = c00 * ori_frac
+    c000 = c00 * (1 - ori_frac)
+    return c000, c001, c010, c011, c100, c101, c110, c111
+
+def CalTrilinearInterpolation(row_list, col_list, mag_list, ori_list, hist_append):
+    """三线性插值
+    """
+    for row_bin, col_bin, mag, ori_bin in zip(row_list, col_list, mag_list, ori_list):
+        row_bin_floor, col_bin_floor, ori_bin_floor = np.floor([row_bin, col_bin, ori_bin]).astype(int)
+        row_frac, col_frac, ori_frac = row_bin - row_bin_floor, col_bin - col_bin_floor, ori_bin - ori_bin_floor
+        if ori_bin_floor < 0:
+            ori_bin_floor += SIFT_DESCR_HIST_BINS
+        if ori_bin_floor >= SIFT_DESCR_HIST_BINS:
+            ori_bin_floor -= SIFT_DESCR_HIST_BINS
+        c000, c001, c010, c011, c100, c101, c110, c111 = CalTrilinearFrac(mag, row_frac, col_frac, ori_frac)
+        hist_append[row_bin_floor + 1, col_bin_floor + 1, ori_bin_floor] += c000
+        hist_append[row_bin_floor + 1, col_bin_floor + 1, (ori_bin_floor + 1) % SIFT_DESCR_HIST_BINS] += c001
+        hist_append[row_bin_floor + 1, col_bin_floor + 2, ori_bin_floor] += c010
+        hist_append[row_bin_floor + 1, col_bin_floor + 2, (ori_bin_floor + 1) % SIFT_DESCR_HIST_BINS] += c011
+        hist_append[row_bin_floor + 2, col_bin_floor + 1, ori_bin_floor] += c100
+        hist_append[row_bin_floor + 2, col_bin_floor + 1, (ori_bin_floor + 1) % SIFT_DESCR_HIST_BINS] += c101
+        hist_append[row_bin_floor + 2, col_bin_floor + 2, ori_bin_floor] += c110
+        hist_append[row_bin_floor + 2, col_bin_floor + 2, (ori_bin_floor + 1) % SIFT_DESCR_HIST_BINS] += c111
+    return hist_append
+
+def NormalizeDescriptor(hist_append):
+    """归一化直方图
+    """
+    descript = hist_append[1:-1, 1:-1, :].flatten()
+    # 归一化
+    threshold = np.linalg.norm(descript) * SIFT_DESCR_MAG_THR
+    descript[descript > threshold] = threshold
+    descript /= max(np.linalg.norm(descript), 1e-7)
+    descript = np.round(512 * descript)
+    descript[descript < 0] = 0
+    descript[descript > 255] = 255
+    return descript
+
+def generateDescriptors(keypoints, gaussian_img):
+    """生成描述子
+    """
+    cnt = 0
+    descriptors = []
+    w_fact = -0.5 / ((0.5 * SIFT_DESCR_WIDTH) ** 2)
+    # 乘以8/2Π，8为直方图有8个bin，2Π为角度取值范围的长度，把方向的索引归于0~8
+    per_degree = SIFT_DESCR_HIST_BINS / 360.
+    for kp in keypoints:
+        octave, layer, scale = UnpackOctave(kp)
+        pr_img = gaussian_img[octave + 1, layer]
+        num_rows, num_cols = pr_img.shape
+        point = np.round(scale * np.array(kp.pt)).astype('int')
+        # bins_per_degree = SIFT_DESCR_HIST_BINS / 360.
+        angle = 360. - kp.angle
+        # d*d*n的三维直方图数组,实际上分配的大小是d+2*d+2*n
+        hist_append = np.zeros((SIFT_DESCR_WIDTH + 2, SIFT_DESCR_WIDTH + 2, SIFT_DESCR_HIST_BINS))
+        # 计算特征描述子过程中，特征点周围的d*d个区域中，每个区域的宽度为m*σ个像素，SIFT_DESCR_SCL_FCTR即m的默认值，σ为特征点的尺度，m=3
+        hist_width = SIFT_DESCR_SCL_FCTR * 0.5 * scale * kp.size
+        # 所以搜索的半径是：SIFT_DESCR_SCL_FCTR * scale * ( d + 1.0 ) * sqrt(2) / 2
+        half_width = int(round(hist_width * np.sqrt(2) * (SIFT_DESCR_WIDTH + 1) * 0.5))
+        # 取图像长宽和r之间的最小值作为r的值
+        half_width = int(min(half_width, np.sqrt(num_rows ** 2 + num_cols ** 2)))
+        # 计算梯度幅值和方向
+        row_list, col_list, mag_list, ori_list = CalGradMagOri(half_width, point, pr_img, num_rows, num_cols, hist_width,w_fact, angle, per_degree)
+        # 计算三线性插值后的直方图
+        hist_append = CalTrilinearInterpolation(row_list, col_list, mag_list, ori_list, hist_append)
+        # 归一化描述子
+        descriptor = NormalizeDescriptor(hist_append)
+        descriptors.append(descriptor)
+    ###############################DEBUG##############################################################
+    #     x1,x2 = point[1] - half_width,point[1] + half_width + 1
+    #     y1,y2 = point[0] - half_width,point[0] + half_width + 1
+    #     x1,x2 = max(0,x1),min(num_rows,x2)
+    #     y1,y2 = max(0,y1),min(num_cols,y2)
+    #     # print(f"{num_rows, num_cols}",end=" ")
+    #     new_img = pr_img[x1:x2,y1:y2]
+    #     if new_img.shape[0] % 4 == 1 and new_img.shape[1] %4 == 1:
+    #         cnt += 1
+    #         plt.subplot(2, 2, cnt)
+    #         #     plt.arrow(x0, y0, length*0.8 * -np.cos(angle), length * -np.sin(angle),
+    #         #       head_width=1, head_length=1, fc='yellow', ec='yellow')
+    #         new_des = descriptor.reshape(4,4,8)
+    #         print(f"point:{point},x1:{x1},x2:{x2},y1:{y1},y2:{y2},shape:{new_img.shape}")
+    #         plt.imshow(new_img)
+    #         # 定义正方形图像的边长
+    #         image_size = new_img.shape[0]
+    #         # 定义图像中每个小方块的边长
+    #         block_size = image_size // 4
+    #         # 遍历每个小方块，并在其中绘制8个方向
+    #         color = "darkslateblue"
+    #         for i in range(5):
+    #             plt.plot([i * block_size, i * block_size], [0, image_size-1], '-', linewidth=3, color=color)
+    #             plt.plot([0, image_size-1], [i * block_size, i * block_size], '-', linewidth=3, color=color)
+    #         for i in range(4):
+    #             for j in range(4):
+    #                 x_start = i * block_size + block_size // 2
+    #                 y_start = j * block_size + block_size // 2
+    #                 for k in range(8):
+    #                     lenth = new_des[i,j,k] / np.max(new_des)
+    #                     plt.arrow(x_start, y_start, block_size/2.5 * np.sin(k*np.pi/4) * lenth, block_size/2.5 * np.cos(k*np.pi/4) * lenth,
+    #                               head_width=0.5, head_length=0.5, fc='yellow', ec='yellow')
+    #         plt.title(f"point:{point},x1:{x1},x2:{x2},y1:{y1},y2:{y2},shape:{new_img.shape}")
+    #         if cnt > 3:
+    #             break
+    # plt.savefig("./img/descript.png")
+    # plt.show()
+    #########################DEBUG##############################################################
+    return np.array(descriptors, dtype='float32')
+
+
 
 if __name__ == '__main__':
+    IS_USE_MULTIPROCESSING = True
     raw_image = cv.imread('box_in_scene.png', 0)
     base_image = Upsampling(raw_image)
     print(f"base_image.shape: {base_image.shape},raw_image.shape: {raw_image.shape}")
@@ -411,15 +627,28 @@ if __name__ == '__main__':
     print(f"guassian_kernels: {guassian_kernels}")
     gaussian_imgs = GenerateGaussianImages(base_image, num_octaves, guassian_kernels)
     DoG_imgs = GenerateDoGImages(gaussian_imgs)
-    start = time.time()
-    keypoints = FindAllKeyPointsMuti(gaussian_imgs, DoG_imgs)
-    end = time.time()
-    print(f"FindAllKeyPoints time = {end - start}")
-    print(f"keypoints: {len(keypoints)}")
-    cvKeyPoints = []
-    for keypoint in keypoints:
-        cvKeyPoints.append(cv.KeyPoint(keypoint.pt[0],keypoint.pt[1], keypoint.size, keypoint.orientation, keypoint.response, keypoint.octave))
-    cvKeyPoints = convertKeypointsToInputImageSize(cvKeyPoints)
+    if IS_USE_MULTIPROCESSING:
+        cvKeyPoints = []
+        start = time.time()
+        keypoints = FindAllKeyPointsMuti(gaussian_imgs, DoG_imgs)
+        end = time.time()
+        print(f"FindAllKeyPointsMutiprosses time = {end - start}")
+        print(f"keypoints: {len(keypoints)}")
+        for keypoint in keypoints:
+            cvKeyPoints.append(cv.KeyPoint(keypoint.pt[0],keypoint.pt[1], keypoint.size, keypoint.orientation, keypoint.response, keypoint.octave))
+        cvKeyPoints = convertKeypointsToInputImageSize(cvKeyPoints)
+    else:
+        start = time.time()
+        keypoints = FindAllKeyPoints(gaussian_imgs, DoG_imgs)
+        end = time.time()
+        cvKeyPoints = keypoints
+        print(f"FindAllKeyPoints time = {end - start}")
+        print(f"keypoints: {len(keypoints)}")
+        cvKeyPoints = convertKeypointsToInputImageSize(cvKeyPoints)
+    removed_cvkeypoints = RemoveDuplicateKeypoints(cvKeyPoints)
+    descriptors = generateDescriptors(removed_cvkeypoints, gaussian_imgs)
+    print(f"descriptors: {np.sum(descriptors)}")
     img1 = cv.drawKeypoints(raw_image, cvKeyPoints, None, color=(0, 255, 0), flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-    # plt.imshow(img1)
+    plt.imshow(img1)
+    plt.show()
     plt.imsave('box_in_scene_keypoints.png', img1)
