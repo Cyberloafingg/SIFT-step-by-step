@@ -15,4 +15,4 @@ if __name__ == '__main__':
     kp,des,img =  MySIFT.SIFTProcess(img,is_use_multiprocessing=True,is_show_img=True)
     detect_sift_opencv(img)
     # 提供一个函数JudgeGoodMatch，输入两张图片的路径，绘制匹配后的图像
-    # MySIFT.JudgeGoodMatch('xiaogonghead.jpg', 'xiaogong.jpg')
+    MySIFT.JudgeGoodMatch('xiaogonghead.jpg', 'xiaogong.jpg')
