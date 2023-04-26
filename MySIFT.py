@@ -6,7 +6,7 @@ from multiprocessing import cpu_count
 import matplotlib.pyplot as plt
 import time
 import warnings
-from tqdm import tqdm
+import os
 warnings.filterwarnings("ignore")
 ################################
 #############ARGUMENTS##########
@@ -49,6 +49,8 @@ SIFT_DESCR_HIST_BINS=8
 SIFT_DESCR_SCL_FCTR=3
 # 算特征描述子过程中，特征描述子向量中元素的阈值(最大值，并且是针对归一化后的特征描述子)，超过此阈值的元素被强行赋值为此阈值，归一化处理中，对特征矢量中值大于0.2进行截断（大于0.2只取0.2）
 SIFT_DESCR_MAG_THR=0.2
+# 特征匹配时的最小匹配点数
+MIN_MATCH_COUNT = 10
 
 ################################
 #############FUNCTIONS##########
@@ -151,8 +153,8 @@ def FindAllKeyPoints(gaussian_imgs, DoG_imgs):
                             keypoints_with_orientations = AssignOrientationToKeypoints(keypoint, octave_index,cal_img)
                             for kk in keypoints_with_orientations:
                                 keypoints.append(kk)
-    # print(f"cnt_local_extrema: {cnt_local_extrema}")
-    # print(f"cnt_local_extrema: {cnt_accruate_keypoints}")
+    print(f"cnt_local_extrema: {cnt_local_extrema}")
+    print(f"cnt_accruate_keypoints: {cnt_accruate_keypoints}")
     return keypoints
 def FindAllKeyPointsMuti(gaussian_imgs, DoG_imgs):
     """
@@ -552,9 +554,6 @@ def GenerateDescriptorsMuti(keypoints, gaussian_img):
     args = []
     for kp in keypoints:
         octave, layer, scale = UnpackOctave(kp)
-        # def __init__(self, pt=(0, 0), size=0, orientation=0, response=0, octave=0, class_id=None, des=None):
-        # cv.KeyPoint(keypoint.pt[0],keypoint.pt[1], keypoint.size, keypoint.orientation, keypoint.response, keypoint.octave)
-        # cv.KeyPoint(*keypoint.pt, keypoint.size, orientation, keypoint.response, keypoint.octave)
         my_kp = MyKeyPoint(kp.pt,kp.size,kp.angle,kp.response,kp.octave)
         args.append((gaussian_img, my_kp, octave, layer, scale))
     print(f"多进程开始生成descriptor共需处理{len(args)}个")
@@ -625,6 +624,7 @@ def GenerateDescriptors(keypoints, gaussian_img):
     return np.array(descriptors, dtype='float32')
 
 def SIFTProcess(img_name,is_use_multiprocessing=True,is_show_img=False):
+    global IS_USE_MULTIPROCESSING
     all_use_time_start = time.time()
     IS_USE_MULTIPROCESSING = is_use_multiprocessing
     if IS_USE_MULTIPROCESSING:
@@ -679,32 +679,28 @@ def SIFTProcess(img_name,is_use_multiprocessing=True,is_show_img=False):
         img1 = cv.drawKeypoints(raw_image, cvKeyPoints, None, color=(0, 255, 0),
                                 flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
         plt.imshow(img1)
+        plt.savefig(f"{os.path.splitext(img_name)[0]}_keypoints.jpg")
         plt.show()
     return removed_cvkeypoints, descriptors, raw_image
 
 def JudgeGoodMatch(match1, match2):
-    MIN_MATCH_COUNT = 10
     kp1, des1,img1 = SIFTProcess(match1,is_show_img=True)
     kp2, des2,img2 = SIFTProcess(match2,is_show_img=True)
-    # Initialize and use FLANN
-    FLANN_INDEX_KDTREE = 0
-    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+    index_params = dict(algorithm=0, trees=5)
     search_params = dict(checks=50)
     flann = cv.FlannBasedMatcher(index_params, search_params)
     matches = flann.knnMatch(des1, des2, k=2)
-    # Lowe's ratio test
     good = []
     for m, n in matches:
         if m.distance < 0.7 * n.distance:
             good.append(m)
     if len(good) > MIN_MATCH_COUNT:
-        # Estimate homography between template and scene
+        # 计算变换矩阵
         src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
         dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
         M = cv.findHomography(src_pts, dst_pts, cv.RANSAC, 5.0)[0]
-
-        # Draw detected template in scene image
+        # 在场景图像中绘制检测到的模板
         h, w = img1.shape
         pts = np.float32([[0, 0],
                           [0, h - 1],
@@ -722,16 +718,17 @@ def JudgeGoodMatch(match1, match2):
         for i in range(3):
             newimg[hdif:hdif + h1, :w1, i] = img1
             newimg[:h2, w1:w1 + w2, i] = img2
-
-        # Draw SIFT keypoint matches
+        # 绘制SIFT关键点匹配
         for m in good:
             pt1 = (int(kp1[m.queryIdx].pt[0]), int(kp1[m.queryIdx].pt[1] + hdif))
             pt2 = (int(kp2[m.trainIdx].pt[0] + w1), int(kp2[m.trainIdx].pt[1]))
-            cv.line(newimg, pt1, pt2, (255, 0, 0))
+            cv.line(newimg, pt1, pt2, (127, 203, 127))
         plt.imshow(newimg)
+        plt.savefig(f"{os.path.splitext(match1)[0]}_{os.path.splitext(match2)[0]}_match.jpg")
         plt.show()
     else:
-        print("Not enough matches are found - %d/%d" % (len(good), MIN_MATCH_COUNT))
+        print(f"图像可能不匹配{len(good)}/{MIN_MATCH_COUNT}")
+    return newimg
 
 # if __name__ == '__main__':
 #     MySIFT()
